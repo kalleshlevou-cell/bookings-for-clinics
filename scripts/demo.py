@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from httpx import ASGITransport, AsyncClient
+from app.core.config import settings
+from app.db.connection import get_connection
+from app.db.schema import init_db
 from app.main import create_app
 
 
@@ -15,6 +18,15 @@ async def main():
     print("=" * 70)
     print(" CLINIC APPOINTMENT BOOKING API - LIVE DEMO & VERIFICATION")
     print("=" * 70)
+
+    # Use an isolated demo database and reset tables to ensure 100% repeatable runs
+    settings.DATABASE_PATH = "demo_clinic_booking.db"
+    conn = get_connection(settings.DATABASE_PATH)
+    init_db(conn)
+    conn.execute("PRAGMA foreign_keys = OFF;")
+    conn.execute("DELETE FROM bookings;")
+    conn.execute("DELETE FROM slots;")
+    conn.execute("PRAGMA foreign_keys = ON;")
 
     app = create_app()
     transport = ASGITransport(app=app)
@@ -38,6 +50,7 @@ async def main():
             "start_time": slot1_start,
             "end_time": slot1_end,
         })
+        assert res1.status_code == 201, f"Failed to create Slot 1: {res1.text}"
         slot1 = res1.json()
         print(f"    Created Slot 1 (ID: {slot1['id']}) Status: {slot1['status']}")
 
@@ -48,10 +61,11 @@ async def main():
             "start_time": slot2_start,
             "end_time": slot2_end,
         })
+        assert res2.status_code == 201, f"Failed to create Slot 2: {res2.text}"
         slot2 = res2.json()
         print(f"    Created Slot 2 (ID: {slot2['id']}) Status: {slot2['status']}")
 
-        # 4. Attempt to create overlapping slot (should fail)
+        # 4. Attempt to create overlapping slot (should fail with 409 Conflict)
         print("\n[4] Attempting to create an overlapping slot for Dr. Curie...")
         overlap_res = await client.post("/slots", json={
             "clinic_id": "clinic_st_jude",
@@ -60,6 +74,7 @@ async def main():
             "end_time": (now + timedelta(hours=2, minutes=45)).isoformat(),
         })
         print(f"    Response: HTTP {overlap_res.status_code} (Expected 409 Conflict)")
+        assert overlap_res.status_code == 409, f"Expected 409, got {overlap_res.status_code}"
         print(f"    Error: {overlap_res.json()['error']['message']}")
 
         # 5. List available slots
@@ -78,6 +93,7 @@ async def main():
             "patient_email": "alice@music.org",
             "patient_phone": "+1-555-0101",
         })
+        assert book_res.status_code == 201, f"Failed to book slot 1: {book_res.text}"
         booking1 = book_res.json()
         print(f"    Booking Confirmed! ID: {booking1['id']}, Status: {booking1['status']}")
 
@@ -89,6 +105,7 @@ async def main():
             "patient_email": "bob@music.org",
         })
         print(f"    Response: HTTP {book_dup_res.status_code} (Expected 409 Conflict)")
+        assert book_dup_res.status_code == 409, f"Expected 409, got {book_dup_res.status_code}"
         print(f"    Error: {book_dup_res.json()['error']['message']}")
 
         # 8. High-concurrency Race Condition Test (Simultaneous booking requests)
@@ -107,8 +124,8 @@ async def main():
         print(f"    Finished 15 concurrent requests:")
         print(f"    --> HTTP 201 Created (Winner):   {success_count} (EXACTLY 1)")
         print(f"    --> HTTP 409 Conflict (Rejected): {conflict_count} (EXACTLY 14)")
-        assert success_count == 1
-        assert conflict_count == 14
+        assert success_count == 1, f"Expected 1 winner, got {success_count}"
+        assert conflict_count == 14, f"Expected 14 conflicts, got {conflict_count}"
         print("    [PASS] Concurrency double-booking prevention verified 100%!")
 
         # 9. Patient Alice cancels her booking for Slot 1 -> Slot reopens!
@@ -116,9 +133,11 @@ async def main():
         cancel_book_res = await client.post(f"/bookings/{booking1['id']}/cancel", json={
             "reason": "Family emergency"
         })
+        assert cancel_book_res.status_code == 200
         print(f"    Booking Cancelled: ID {cancel_book_res.json()['id']}, Status: {cancel_book_res.json()['status']}")
         
         slot1_reopened = await client.get(f"/slots/{slot1['id']}")
+        assert slot1_reopened.json()["status"] == "available"
         print(f"    Slot 1 status after cancellation: '{slot1_reopened.json()['status']}' (Reopened to available!)")
 
         # 10. Patient Charlie can now book the reopened Slot 1
@@ -128,11 +147,13 @@ async def main():
             "patient_name": "Charlie Chaplin",
             "patient_email": "charlie@film.org",
         })
+        assert book_charlie.status_code == 201
         print(f"    Booking Confirmed for Charlie! Status: {book_charlie.json()['status']}")
 
         # 11. Clinic cancels Slot 1 while Charlie is booked -> Cascades cancellation
         print("\n[11] Clinic decides to cancel Slot 1...")
         clinic_cancel = await client.post(f"/slots/{slot1['id']}/cancel")
+        assert clinic_cancel.status_code == 200
         print(f"    Slot Cancellation Response: {clinic_cancel.json()['message']}")
         print(f"    Slot Status: {clinic_cancel.json()['slot']['status']}")
         print(f"    Affected Booking ID Cancelled: {clinic_cancel.json()['cancelled_booking_id']}")
